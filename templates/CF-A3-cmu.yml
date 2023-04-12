@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  EKSRoleARN:
+    Type: String
+  EKSClusterName:
+    Type: String
+  RDSInstanceName:
+    Type: String
+  RDSDBName:
+    Type: String
+  RDSDBUsername:
+    Type: String
+  RDSDBPassword:
+    Type: String
+
+
+Resources:
+  ##networking
+  Vpc:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.3.0/24
+
+  PrivateSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.4.0/24
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+
+  VpcGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  NATGateway:
+   Type: AWS::EC2::NatGateway
+   Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref Vpc
+
+  RouteNATGateway:
+    DependsOn: NATGateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicSubnet1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  MySubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupName: my-subnet-group2
+      DBSubnetGroupDescription: My subnet group for RDS
+      SubnetIds: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  MyLaunchConfig:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      ImageId: "ami-0c94855ba95c71c99"
+      InstanceType: "t2.micro"
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          echo "Hello, World!" > index.html
+
+  MyAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AvailabilityZones:
+        - us-east-1a
+        - us-east-1b
+      LaunchConfigurationName: !Ref MyLaunchConfig
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: "2"
+      HealthCheckGracePeriod: "300"
+      LoadBalancerNames:
+        - !Ref MyLoadBalancer
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  MyLoadBalancer:
+    Type: "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Listeners:
+        - LoadBalancerPort: "9092"
+          InstancePort: "9092"
+          Protocol: "TCP"
+      HealthCheck:
+        Target: "TCP:9092"
+        HealthyThreshold: "3"
+        UnhealthyThreshold: "5"
+        Interval: "30"
+        Timeout: "5"
+      SecurityGroups: 
+        - !Ref ELBSecurityGroup
+
+      
+  #SecurityGroups
+  EC2SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: 
+          Ref: Vpc
+      GroupDescription: "Security group for EC2 instances"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 9092  
+          ToPort: 9092
+          SourceSecurityGroupId:
+            Fn::GetAtt:
+            - ELBSecurityGroup
+            - GroupId
+        - IpProtocol: tcp  #http configured to ALB
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId:
+            Fn::GetAtt:
+            - ELBSecurityGroup
+            - GroupId
+
+  ELBSecurityGroup:
+      Type: 'AWS::EC2::SecurityGroup'
+      Properties:
+        GroupDescription: security group ec2 allowing http and ssh
+        VpcId: 
+          Ref: Vpc
+        SecurityGroupEgress:
+          - Description: Allow all outbound traffic
+            IpProtocol: "-1" #=ALL
+            CidrIp: 0.0.0.0/0
+        SecurityGroupIngress:
+          - IpProtocol: tcp  
+            FromPort: 9092
+            ToPort: 9092
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp  
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+
+
+  EKSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for Amazon EKS cluster
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: EKSSG
+    
+  RDSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for RDS MySQL instance
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: RDSSecurityGroup
+
+
+  #EKS  
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: my-eks-cluster
+      Version: "1.24"
+      RoleArn: !Ref EKSRoleARN
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet2
+          - !Ref PublicSubnet1
+
+ 
+  #MyNodeGroup:
+   # Type: "AWS::EKS::Nodegroup"
+    #Properties:
+     # ClusterName: !Ref EksCluster
+      #NodegroupName: "my-node-group"
+      #NodeRole: !Ref EKSRoleARN
+      #Subnets:
+       #   - !Ref PublicSubnet2
+       #  - !Ref PublicSubnet1
+      #InstanceTypes:
+       # - "t2.micro"
+      #ScalingConfig:
+       # MinSize: 4
+       # MaxSize: 6
+       # DesiredSize: 4
+      #Tags: 
+        #Key: kubernetes.io/cluster/my-eks-cluster
+        #Value: owned 
+      
+
+  
+  #Aurora
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-mysql
+      MasterUsername: !Ref RDSDBUsername
+      MasterUserPassword: !Ref RDSDBPassword
+      BackupRetentionPeriod: '7'
+      PreferredBackupWindow: 01:00-02:00
+      PreferredMaintenanceWindow: mon:03:00-mon:04:00
+      DBSubnetGroupName: !Ref MySubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RDSSecurityGroup
+      StorageEncrypted: true
+
+  DatabasePrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-mysql
+      DBClusterIdentifier: !Ref "DatabaseCluster"
+      DBInstanceClass: db.t3.small
+      DBSubnetGroupName: !Ref MySubnetGroup
+      PubliclyAccessible: false
+
+  DatabaseReplicaInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-mysql
+      DBClusterIdentifier: !Ref "DatabaseCluster"
+      DBInstanceClass: db.t3.small
+      DBSubnetGroupName: !Ref MySubnetGroup
+      PubliclyAccessible: false
+
+  RDSInbound:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+        IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId: !Ref EKSSecurityGroup
+        GroupId:
+          Fn::GetAtt:
+            - RDSSecurityGroup
+            - GroupId
+
+  EKSInbound:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+        IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0     
+        GroupId:
+          Fn::GetAtt:
+            - EKSSecurityGroup
+            - GroupId
+
+Outputs:
+  EKSClusterEndpoint:
+    Description: Endpoint for EKS cluster 1
+    Value: !GetAtt EksCluster.Endpoint
+  RDSInstanceEndpoint:
+    Description: Endpoint for RDS MySQL instance
+    Value: !GetAtt DatabasePrimaryInstance.Endpoint.Address
+  
+
+
+
+
